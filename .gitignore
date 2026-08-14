@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# Xcode
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+
+# Build and release artifacts
+dist/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.cer
+*.p12
+*.mobileprovision
+
+# Local agent artifacts
+.pi-subagents/
