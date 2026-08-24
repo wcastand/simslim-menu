@@ -64,6 +64,106 @@ enum SimSlimError: LocalizedError {
     }
 }
 
+@MainActor
+final class AgentProxyStore: ObservableObject {
+    @Published private(set) var isRunning = false
+    @Published private(set) var token = ""
+    @Published private(set) var errorMessage: String?
+    @Published var isEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isEnabled, forKey: "agentProxyEnabled")
+            isEnabled ? start() : stop()
+        }
+    }
+
+    private var process: Process?
+
+    init() {
+        isEnabled = UserDefaults.standard.object(forKey: "agentProxyEnabled") as? Bool ?? true
+    }
+
+    func startIfEnabled() {
+        if isEnabled { start() }
+    }
+
+    func start() {
+        guard process == nil else { return }
+        guard let executableURL else {
+            errorMessage = "agent-device was not found."
+            return
+        }
+
+        let task = Process()
+        let output = Pipe()
+        let newToken = Self.makeToken()
+        task.executableURL = executableURL
+        task.arguments = ["proxy", "--port", "4310", "--daemon-auth-token", newToken]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "\(executableURL.deletingLastPathComponent().path):\(environment["PATH"] ?? "/usr/bin:/bin")"
+        task.environment = environment
+        task.standardOutput = output
+        task.standardError = output
+        task.terminationHandler = { [weak self, weak task] finished in
+            let message = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            Task { @MainActor in
+                guard let self, let task, self.process === task else { return }
+                self.process = nil
+                self.isRunning = false
+                self.token = ""
+                if self.isEnabled {
+                    self.errorMessage = message?.isEmpty == false
+                        ? message
+                        : "Agent proxy stopped unexpectedly (exit \(finished.terminationStatus))."
+                }
+            }
+        }
+
+        do {
+            try task.run()
+            process = task
+            token = newToken
+            errorMessage = nil
+            isRunning = true
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stop() {
+        let runningProcess = process
+        process = nil
+        isRunning = false
+        token = ""
+        errorMessage = nil
+        runningProcess?.terminate()
+    }
+
+    private static func makeToken() -> String {
+        let token = (UUID().uuidString + UUID().uuidString)
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+        assert(token.count == 64)
+        return token
+    }
+
+    private var executableURL: URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var candidates = [
+            URL(fileURLWithPath: "/opt/homebrew/bin/agent-device"),
+            URL(fileURLWithPath: "/usr/local/bin/agent-device"),
+            home.appending(path: ".local/bin/agent-device")
+        ]
+        let nvm = home.appending(path: ".nvm/versions/node")
+        if let versions = try? FileManager.default.contentsOfDirectory(at: nvm, includingPropertiesForKeys: nil) {
+            candidates += versions.sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending
+            }.map { $0.appending(path: "bin/agent-device") }
+        }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+}
+
 enum SimSlimClient {
     private static var executableURL: URL? {
         let candidates = [
@@ -245,9 +345,10 @@ struct PopoverShape: Shape {
 
 struct PopoverContainer: View {
     @ObservedObject var store: SimulatorStore
+    @ObservedObject var agentProxy: AgentProxyStore
 
     var body: some View {
-        SimulatorListView(store: store)
+        SimulatorListView(store: store, agentProxy: agentProxy)
             .padding(.top, 10)
             .background {
                 PopoverShape().fill(Color(nsColor: .windowBackgroundColor))
@@ -263,6 +364,7 @@ struct PopoverContainer: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = SimulatorStore()
+    private let agentProxy = AgentProxyStore()
     private var statusItem: NSStatusItem?
     private var panel: SimulatorPanel?
     private var outsideClickMonitor: Any?
@@ -286,6 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
         store.load()
         store.startAutoRefresh()
+        agentProxy.startIfEnabled()
 
         // Show the panel once at launch so it remains discoverable when a
         // menu-bar organizer places a new item in its hidden section.
@@ -309,7 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configurePanel() {
         let panel = SimulatorPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 336),
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 388),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -321,8 +424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .popUpMenu
         panel.collectionBehavior = [.transient, .fullScreenAuxiliary]
         panel.contentView = NSHostingView(
-            rootView: PopoverContainer(store: store)
-                .frame(minWidth: 310, maxWidth: .infinity, minHeight: 336, maxHeight: 336)
+            rootView: PopoverContainer(store: store, agentProxy: agentProxy)
+                .frame(minWidth: 310, maxWidth: .infinity, minHeight: 388, maxHeight: 388)
         )
         self.panel = panel
     }
@@ -382,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        agentProxy.stop()
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
     }
 }
@@ -397,10 +501,14 @@ struct SimSlimMenuApp: App {
 
 struct SimulatorListView: View {
     @ObservedObject var store: SimulatorStore
+    @ObservedObject var agentProxy: AgentProxyStore
+    @State private var copiedProxyToken = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            Divider()
+            agentProxyControls
             Divider()
 
             if let errorMessage = store.errorMessage, store.simulators.isEmpty {
@@ -433,8 +541,52 @@ struct SimulatorListView: View {
                     }
                 }
             }
-
         }
+    }
+
+    private var agentProxyControls: some View {
+        HStack(spacing: 10) {
+            Image(systemName: agentProxy.isRunning ? "network.badge.shield.half.filled" : "network.slash")
+                .foregroundStyle(agentProxy.isRunning ? .green : .secondary)
+                .frame(width: 30)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Agent proxy")
+                    .font(.subheadline.weight(.medium))
+                Text(agentProxy.errorMessage ?? (agentProxy.isRunning ? "Listening on port 4310" : "Not running"))
+                    .font(.caption)
+                    .foregroundStyle(agentProxy.errorMessage == nil ? Color.secondary : Color.red)
+                    .lineLimit(1)
+                    .help(agentProxy.errorMessage ?? "")
+            }
+
+            Spacer()
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(agentProxy.token, forType: .string)
+                copiedProxyToken = true
+                Task {
+                    try? await Task.sleep(for: .seconds(1.2))
+                    copiedProxyToken = false
+                }
+            } label: {
+                Image(systemName: copiedProxyToken ? "checkmark" : "doc.on.doc")
+                    .contentTransition(.symbolEffect(.replace))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(copiedProxyToken ? .green : .secondary)
+            .disabled(!agentProxy.isRunning)
+            .help(copiedProxyToken ? "Copied" : "Copy agent proxy token")
+
+            Toggle("Agent proxy", isOn: $agentProxy.isEnabled)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .help(agentProxy.isEnabled ? "Turn off agent proxy" : "Turn on agent proxy")
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 51)
     }
 
     private var header: some View {
